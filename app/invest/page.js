@@ -62,7 +62,7 @@ function isValidYieldString(value) {
  *
  * @param {URLSearchParams} searchParams
  * @param {object} [defaults=DEFAULT_FILTERS]
- * @returns {{ filters: object, searchQuery: string }}
+ * @returns {{ filters: object, searchQuery: string, page: number }}
  */
 export function parseFiltersFromSearchParams(searchParams, defaults = DEFAULT_FILTERS) {
   const params = sanitizeMarketplaceSearchParams(searchParams ?? new URLSearchParams());
@@ -94,6 +94,10 @@ export function parseFiltersFromSearchParams(searchParams, defaults = DEFAULT_FI
     .filter((s) => VALID_STATUSES.has(s));
 
   const searchQuery = (params.get("q") ?? "").trim();
+  const rawPage = params.get("page") ?? "";
+  const parsedPage = Number(rawPage);
+  const page =
+    /^[1-9]\d*$/.test(rawPage) && Number.isSafeInteger(parsedPage) ? parsedPage : 1;
 
   return {
     filters: {
@@ -108,6 +112,7 @@ export function parseFiltersFromSearchParams(searchParams, defaults = DEFAULT_FI
       statuses,
     },
     searchQuery,
+    page,
   };
 }
 
@@ -119,7 +124,7 @@ export function parseFiltersFromSearchParams(searchParams, defaults = DEFAULT_FI
  * @param {string} [searchQuery=""]
  * @returns {URLSearchParams}
  */
-export function buildSearchParams(filters, searchQuery = "") {
+export function buildSearchParams(filters, searchQuery = "", page = 1) {
   const params = new URLSearchParams();
   const trimmedSearch = (searchQuery ?? "").trim();
   if (trimmedSearch) params.set("q", trimmedSearch);
@@ -137,6 +142,10 @@ export function buildSearchParams(filters, searchQuery = "") {
 
   if (Array.isArray(filters.statuses) && filters.statuses.length > 0) {
     params.set("statuses", filters.statuses.filter((status) => VALID_STATUSES.has(status)).join(","));
+  }
+
+  if (Number.isSafeInteger(page) && page > 1) {
+    params.set("page", String(page));
   }
 
   return params;
@@ -195,17 +204,23 @@ export function applySortToList(list, filters) {
 
   const multiplier = dir === "asc" ? 1 : -1;
 
-  return [...list].sort((a, b) => {
-    let diff = 0;
-    if (column === "amount") {
-      diff = parseAmount(a.amount) - parseAmount(b.amount);
-    } else if (column === "yield") {
-      diff = parseYield(a.yield) - parseYield(b.yield);
-    } else if (column === "maturity") {
-      diff = new Date(a.dueDate) - new Date(b.dueDate);
-    }
-    return multiplier * diff;
-  });
+  return list
+    .map((invoice, index) => ({ invoice, index }))
+    .sort((left, right) => {
+      const a = left.invoice;
+      const b = right.invoice;
+      let diff = 0;
+      if (column === "amount") {
+        diff = parseAmount(a.amount) - parseAmount(b.amount);
+      } else if (column === "yield") {
+        diff = parseYield(a.yield) - parseYield(b.yield);
+      } else if (column === "maturity") {
+        diff = new Date(a.dueDate) - new Date(b.dueDate);
+      }
+      const ordered = multiplier * diff;
+      return ordered === 0 ? left.index - right.index : ordered;
+    })
+    .map(({ invoice }) => invoice);
 }
 
 function triggerDownload(text, filename, mimeType = "application/json") {
@@ -319,7 +334,7 @@ export function InvestMarketplace({
   const [hasMore, setHasMore] = useState(false);
   const [cursorError, setCursorError] = useState("");
   const [pageLoading, setPageLoading] = useState(false);
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [visibleCount, setVisibleCount] = useState(initialUrlState.page * PAGE_SIZE);
   // Filter state
   const [searchQuery, setSearchQuery] = useState("");
   const [loadError, setLoadError] = useState("");
@@ -327,7 +342,11 @@ export function InvestMarketplace({
   const [debouncedSearch, setDebouncedSearch] = useState(initialUrlState.searchQuery);
 
   const committedSearchRef = useRef(
-    buildSearchParams(initialUrlState.filters, initialUrlState.searchQuery).toString()
+    buildSearchParams(
+      initialUrlState.filters,
+      initialUrlState.searchQuery,
+      initialUrlState.page
+    ).toString()
   );
   const urlUpdateTimerRef = useRef(null);
 
@@ -341,7 +360,12 @@ export function InvestMarketplace({
     setFilters(parsed.filters);
     setSearchQuery(parsed.searchQuery);
     setDebouncedSearch(parsed.searchQuery);
-    committedSearchRef.current = buildSearchParams(parsed.filters, parsed.searchQuery).toString();
+    setVisibleCount(parsed.page * PAGE_SIZE);
+    committedSearchRef.current = buildSearchParams(
+      parsed.filters,
+      parsed.searchQuery,
+      parsed.page
+    ).toString();
     // searchParamsValue is intentionally omitted; searchParamsString is the stable signal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParamsString]);
@@ -451,15 +475,16 @@ export function InvestMarketplace({
   // history entries for every filter keystroke) and a debounce prevents rapid
   // successive updates.
   useEffect(() => {
-    const next = buildSearchParams(filters, debouncedSearch).toString();
+    const currentPage = Math.max(1, Math.ceil(visibleCount / PAGE_SIZE));
+    const next = buildSearchParams(filters, debouncedSearch, currentPage).toString();
     if (next === committedSearchRef.current) return;
     clearTimeout(urlUpdateTimerRef.current);
     urlUpdateTimerRef.current = setTimeout(() => {
       committedSearchRef.current = next;
-      router.replace(`?${next}`, { scroll: false });
+      router.replace(next ? `?${next}` : "?", { scroll: false });
     }, URL_SYNC_DEBOUNCE_MS);
     return () => clearTimeout(urlUpdateTimerRef.current);
-  }, [filters, debouncedSearch, router]);
+  }, [filters, debouncedSearch, visibleCount, router]);
 
   // Reset the visible page count to PAGE_SIZE whenever the filters or debounced
   // search term change, using the React-sanctioned "adjust state during render"
@@ -635,7 +660,17 @@ export function InvestMarketplace({
    * keyboard users do not lose their place in the page.
    */
   const handleLoadMore = useCallback(async () => {
-    if (pageLoadInFlightRef.current || pageLoading || !hasMore || !nextCursor || cursorError) return;
+    if (pageLoadInFlightRef.current || pageLoading || cursorError) return;
+
+    if (visibleCount < filteredInvoices.length) {
+      setVisibleCount((prev) => Math.min(prev + PAGE_SIZE, filteredInvoices.length));
+      setTimeout(() => {
+        loadMoreRef.current?.focus();
+      }, 0);
+      return;
+    }
+
+    if (!hasMore || !nextCursor) return;
 
     pageLoadInFlightRef.current = true;
     const currentInvoices = Array.isArray(invoices) ? invoices : [];
@@ -676,7 +711,18 @@ export function InvestMarketplace({
         loadMoreRef.current?.focus();
       }, 0);
     }
-  }, [pageLoading, hasMore, nextCursor, cursorError, invoices, loadInvoices, filters, debouncedSearch]);
+  }, [
+    pageLoading,
+    hasMore,
+    nextCursor,
+    cursorError,
+    visibleCount,
+    filteredInvoices.length,
+    invoices,
+    loadInvoices,
+    filters,
+    debouncedSearch,
+  ]);
 
   // ── Bulk actions ──────────────────────────────────────────────────────────
   const handleToggleSelectAll = useCallback(() => {
@@ -943,7 +989,7 @@ export function InvestMarketplace({
                   </li>
                 ))}
               </ul>
-              {visibleCount < filteredInvoices.length && hasMore && (
+              {(visibleCount < filteredInvoices.length || (hasMore && nextCursor)) && (
                 <button
                   ref={loadMoreRef}
                   type="button"
@@ -955,7 +1001,7 @@ export function InvestMarketplace({
                   {pageLoading ? "Loading…" : copy.invest.loadMore}
                 </button>
               )}
-              {!hasMore && visibleCount > PAGE_SIZE && (
+              {!hasMore && visibleCount >= filteredInvoices.length && visibleCount > PAGE_SIZE && (
                 <div className="mt-6 text-sm text-slate-400">{copy.invest.endOfList}</div>
               )}
               <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900/30 p-4 text-sm text-slate-400">
