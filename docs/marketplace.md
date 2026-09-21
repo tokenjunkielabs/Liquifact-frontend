@@ -23,7 +23,7 @@ The marketplace is built around the `InvestMarketplace` component (`app/invest/p
 - **Search** by issuer name with keyboard shortcut (`/`)
 - **Filtering** by status, currency, yield range, and maturity date
 - **Sorting** by amount, yield, or maturity
-- **Pagination** with "Load more" functionality
+- **Pagination** with "Load more" functionality and shareable URL page state
 - **Screen reader announcements** for state changes
 
 The marketplace uses a client-side filtering approach: all invoices are fetched once, then filtered/sorted in the browser. This provides instant feedback as users adjust filters.
@@ -48,8 +48,9 @@ Main marketplace container that fetches invoices and manages filtering/sorting s
 
 - Fetches invoices on mount using `loadInvoices({ signal })`
 - Supports retry via ErrorBanner action button
-- Resets pagination when filters change
-- Debounces search input (300ms)
+- Treats validated URL query state as the source of truth for search, filters, sort, and page depth
+- Restores page depth on reload/back/forward and resets to page 1 when search or filters change
+- Debounces search input (300ms) and URL writes (200ms)
 - Announces state changes to screen readers via `aria-live="polite"`
 
 #### Example
@@ -60,6 +61,20 @@ import { InvestMarketplace } from "@/app/invest/page";
 // With custom loader
 <InvestMarketplace loadInvoices={fetchInvoicesFromApi} />
 ```
+
+---
+
+### Shareable marketplace route state
+
+The Invest view serializes only validated state into the URL. Supported keys are `q`, `currency`, `yieldMin`, `yieldMax`, `maturityFrom`, `maturityTo`, `sort`, `sortDir`, `statuses`, and `page`.
+
+- `page=1` is omitted; pages greater than one are preserved so a shared or reloaded link restores the same visible depth.
+- Invalid page values, unsupported sort/currency/status values, and malformed dates are discarded instead of leaking into application state.
+- Filter or debounced search changes reset pagination to the first page before the canonical query string is written.
+- Equal sort keys preserve their input order, making the client-side sort stable.
+- Invoice detail links preserve the sanitized marketplace query so Back navigation returns to the same view.
+
+`sanitizeMarketplaceSearchParams` in `lib/marketplaceRoute.js` owns route validation; `parseFiltersFromSearchParams` and `buildSearchParams` in `app/invest/page.js` own the view-state round trip.
 
 ---
 
